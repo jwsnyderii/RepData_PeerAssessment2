@@ -1,0 +1,288 @@
+---
+title: "The Human and Economic Cost of Weather Events in the USA"
+subtitle: "Reproducible Research: Course Project 2"
+author: "John Snyder"
+date: "August 18, 2018"
+output: 
+    html_document:
+      number_sections: yes
+      theme: united
+      toc: yes
+      toc_float:
+         collapsed: no
+         smooth_scroll: yes
+        
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo    = TRUE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache   = TRUE )
+```
+
+# Synopsis
+
+In this document, data from the NOAA Storm Database is used to determine the relative and absolute human and economic costs of weather events in the United States of America. The database used contains data from 1950 to 2012.  
+
+One of the major challenges in working with the NOAA Storm Database is the fact that weather event reporters use inconsistent terminology when classifying weather events. As a result, there are approximately 1000 unique values for event types in the database when only 48 are expected according to database documentation.  In this document, it is shown how approximate, or "fuzzy", string matching, using the `stringdist` package, can be used to re-categorize the weather events.
+
+Using the re-categorized data, it is determined that the weather event type with the largest impact on human health and economic cost is tornadoes.  Finally, this document shows the geographical distribution of human and economic costs of tornadoes. 
+
+# Data Processing
+
+## Environement Setup and Loading Data
+
+Load the R packages necessary for data analysis and visualization:
+
+```{r loadLibraries}
+# Load Libraries
+library(forcats)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(lubridate)
+library(stringdist)
+library(maps)
+```
+
+If the NOAA Storm Database does not currently exist on disc, download it.  Then load the data into the R environment and use functions from the `lubridate` package to create a vector of unique years covered by the database:
+
+```{r loadData}
+remoteFile <- "https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2"
+localFile  <- "StormData.csv.bz2"
+
+# Download database if not currently on disc
+if (!file.exists(localFile)) download.file(remoteFile, localFile)
+
+# Load data into R
+stormData <- read.csv(localFile, stringsAsFactors = FALSE)
+
+# Create a vector of unique years covered by the database
+years <- unique(year(mdy_hms(stormData$BGN_DATE)))
+```
+
+## Fixing Event Categorization
+
+There are `r length(unique(stormData$EVTYPE))` unique event types (EVTYPE) in the storm database. In order to use this data, the events must be re-categorized into a smaller number of types.  The 48 event types listed in the National Weather Service [Storm Data Documentation](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf) (see Table 1 on page 6) were copied into a file named "Storm_Data_Event_Table.txt" and this table is loaded into R:
+
+```{r loadEventTypes}
+# Load 48 official event types
+events <- read.csv("Storm_Data_Event_Table.txt", header = FALSE, stringsAsFactors = FALSE)
+events <- events[[1]]
+```
+
+Common abbreviations used by weather event reporters are "TSTM" for Thunderstorm and either "FLD" or "FLDG" for Flood.  The `gsub` function is used to replace these abbreviations in the event types:
+
+```{r abbreviationReplacement}
+stormData$EVTYPE <- gsub("TSTM", "Thunderstorm", stormData$EVTYPE, ignore.case = TRUE)
+stormData$EVTYPE <- gsub("FLD|FLDG", "Flood", stormData$EVTYPE, ignore.case = TRUE)
+uniqueIDs <- unique(stormData$EVTYPE)
+```
+
+These substitutions brings the number of unique event types down to `r length(uniqueIDs)`.
+
+Next, the `stringsim` function from the `stringdist` package is used to create a similarity matrix where the columns correspond to the 48 official event types, and the rows correspond to the `r length(uniqueIDs)` unique event types in the database.  The value in each cell of the matrix indicates how closely the official event type (column) matches the unique event type (row) from the data, with a value of 1 corresponding to a perfect match and a value of 0 corresponding to no match. 
+
+```{r createSimularityMatrix}
+simMat <- sapply(toupper(events), stringsim, toupper(uniqueIDs), method = "osa")
+```
+
+The `which.max` function is then used to collapse the similarity matrix into a replacement vector and and the `max` function is used to create similarity vector which indicates how similar the proposed replacement is to the original unique event type: 
+
+```{r createReplacementVector}
+replaceVec <- apply(simMat, 1, which.max) # Our proposed replacement vector
+replaceSim <- apply(simMat, 1, max) # The similarity of the replacement match
+```
+
+The replacement vector and similarity vector are then used to create a function that takes as arguments an unique event type from the data and a minimum similarity requirement.  The function returns either the match from the replacement vector, or the catch-all type of "Other" if the similarity of the match is not greater than the requested minimum similarity:
+
+```{r re-categorizeFunction}
+# A function that takes an EVTYPE and outputs a re-catagorized event type
+fixevtype <- function(x, simMin = 0.2) {
+    idIndex <- which(uniqueIDs == x)
+    replaceIndex <- replaceVec[idIndex]
+    if (replaceSim[idIndex] >= simMin) {
+        return(events[replaceIndex])
+    } else {
+        return("Other")
+    }
+} 
+```
+
+This function is used to create a new event type variable in the storm data frame, EVTYPE2:
+
+```{r re-categorize}
+stormData$EVTYPE2 <- sapply(stormData$EVTYPE, fixevtype, simMin = 0.4)
+percentOther <- with(stormData, 100* sum(EVTYPE2 == "Other")/length(EVTYPE2)) 
+```
+
+Using a minimum replacement similarity of 0.4, it is found that only `r percentOther`% of the events are classified as "Other".
+
+Finally, the new, corrected EVTYPE2 variable is used to create a table which summarizes the total number of fatalities and injuries, and the total cost of property damage and crop damage for each weather event type:
+
+```{r createSummaryTable}
+summaryTable<- stormData %>% 
+               group_by(EVTYPE2) %>% 
+               summarize(Fatalities = sum(FATALITIES),
+                         Injuries   = sum(INJURIES), 
+                         Propdmg    = sum(PROPDMG), 
+                         Cropdmg    = sum(CROPDMG))
+```
+
+# Results
+
+## The Human Cost of Weather Events
+
+Using the summary table described above, the effect of different types of weather events can be determined:
+
+```{r humanCost, fig.height=8, fig.width=12}
+# Create a new data frame with the top 10 weather events in terms of human cost
+humanCost <- summaryTable                           %>% 
+              select(EVTYPE2, Fatalities, Injuries) %>% 
+              arrange(desc(Fatalities + Injuries))  %>%
+              head(n=10)                            %>%   
+              melt(value.name = "count", id = "EVTYPE2")
+
+# Manually factor and assign levels to EVTYPE2 so event types will be shown
+# is descending order on the plot
+humanCost$EVTYPE2 <- with(humanCost, factor(EVTYPE2, levels = unique(EVTYPE2)))
+
+# Plot the human cost of weather events
+ggplot(humanCost) + 
+    geom_col(aes(x = EVTYPE2, y = count, fill = variable)) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) +
+    labs(fill     = "Legend", 
+         x        = "Event Type",
+         y        = "Count",
+         title    = "The Human Cost of Weather Events in the USA",
+         subtitle = sprintf("%d to %d", min(years), max(years)))
+```
+
+From the above figure we can see that tornadoes are by far the weather event with the greatest effect on human health.
+
+## The Economic Cost of Weather Events
+
+The economic cost of different types of weather events can also be determined. 
+
+```{r economicCost, fig.height=8, fig.width=12}
+# Create a new data frame with the top 10 weather events in terms of economic cost
+economicCost <- summaryTable                       %>% 
+                 select(EVTYPE2, Cropdmg, Propdmg) %>% 
+                 arrange(desc(Propdmg + Cropdmg))  %>% 
+                 head(n=10)                        %>% 
+                 melt(value.name = "cost", id = "EVTYPE2")
+
+# Manually factor and assign levels to EVTYPE2 so event types will be shown
+# is descending order on the plot
+economicCost$EVTYPE2  <- with(economicCost, factor(EVTYPE2, levels = unique(EVTYPE2)))
+levels(economicCost$variable) <- c("Crop", "Property")
+
+# Plot the economic cost of weather events
+ggplot(economicCost) + 
+   geom_col(aes(x = EVTYPE2, y = cost/1e6, fill = variable)) + 
+   theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) +
+   labs(fill     = "Damage Type",
+        x        = "Event Type",
+        y        = "Cost (Millions of Dollars)",
+        title    = "The Economic Cost of Weather Events in the USA",
+        subtitle = sprintf("%d to %d", min(years), max(years)))
+```
+
+From the above figure, we see that tornadoes also have the greatest economic impact.
+
+## Mapping of Tornado Effects
+
+Considering tornadoes have the greatest human and economic cost, it is instructive to see how tornado damage is distributed geographically in the USA
+
+From the storm data frame, select the "Tornado" events and create a new data frame from this subset:
+```{r tornadoSubset}
+tornadoData <- stormData %>%
+               filter(EVTYPE2 == "Tornado") %>%
+               select(BGN_DATE, COUNTYNAME, STATE, FATALITIES, INJURIES, PROPDMG, CROPDMG)
+```
+
+Next, a function which translates the state abbreviation, found in the STATE variable of the storm data frame, into the state name is created. This function is used to create the `STATENAME` variable in our tornado data frame which will be used plot the data on a map. 
+
+```{r getStateNameFun, fig.height=10, fig.width=16}
+getStateName <- function(x) {
+    if(x %in% state.abb) {
+        return(as.character(state.name[which(x == state.abb)]))
+    } else {
+        return(NA) # Return NA if we can't find the state abbreviation
+    }
+}
+
+tornadoData$STATENAME <- tornadoData$STATE    %>% 
+                         sapply(getStateName) %>%
+                         unlist()             %>%
+                         as.vector()          %>% 
+                         tolower()
+```
+
+Calculate the total number of fatalities and injuries, and the total cost of property and crop damage due to tornadoes.  These totals will be used to calculate the percent of totals occurring in each state:
+
+```{r calcTorandoTotals}
+totalFatalities <- tornadoData %>% with(sum(FATALITIES))
+totalInjuries   <- tornadoData %>% with(sum(INJURIES))
+totalPropdmg    <- tornadoData %>% with(sum(PROPDMG))
+totalCropdmg    <- tornadoData %>% with(sum(CROPDMG))
+```
+
+To plot the tornado effects onto a map of the USA, the percent value of the effects are separated into bins 2.5% wide:
+
+```{r mapPlotPrep}
+cutBreaks <- seq(0, 30, 2.5) # Bin cutoffs
+cutLabels <- character(length(cutBreaks)-1) # Plot legend labels
+
+# Plot legend labels = "0-2.5", "2.5-5", etc
+for(i in 1:(length(cutBreaks)-1)) {
+    cutLabels[i] <- sprintf("%.1f-%.1f", cutBreaks[i+1], cutBreaks[i])
+}
+```
+
+Create "tall" data frame of tornado effects with the state name as the indexing variable:
+
+```{r mapPlotDataFrame}
+tornadoState <- tornadoData               %>% 
+                filter(!is.na(STATENAME)) %>% 
+                group_by(STATENAME)       %>% 
+                summarise(FATALITIES = 100*sum(FATALITIES)/totalFatalities, 
+                          INJURIES   = 100*sum(INJURIES)/totalInjuries,
+                          PROPDMG    = 100*sum(PROPDMG)/totalPropdmg,
+                          CROPDMG    = 100*sum(CROPDMG)/totalCropdmg) %>%
+                melt(id = "STATENAME")    %>%
+                mutate(discrete = fct_rev(cut(value, cutBreaks, 
+                                              labels = cutLabels,
+                                              include.lowest = TRUE)))
+
+# Manually assign levels to make the plot look correct
+variableLevels <- c("Fatalities", "Injuries", "Property Damage", "Crop Damage")
+levels(tornadoState$variable) <- toupper(variableLevels)
+
+```
+
+Finally, plot the distribution of tornado effects by state in the continental USA:
+
+```{r mapPlot, fig.height=10, fig.width=16}
+states_map <- map_data("state")
+
+ggplot(tornadoState, aes(map_id = STATENAME))           +
+     geom_map(aes(fill=discrete), map = states_map)     +
+     borders("state", colour = "wheat")                 +
+     expand_limits(x=states_map$long, y=states_map$lat) +
+     scale_fill_brewer(type      = "div", 
+                       palette   = "Spectral", 
+                       direction = 1)                   +
+     theme(
+         axis.text.x  = element_blank(),
+         axis.text.y  = element_blank(),
+         axis.ticks   = element_blank(),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank())                +
+     facet_wrap( ~ variable, scales = "free")           +
+     labs(fill = "% of Total")                          +
+     ggtitle("The Effects of Tornados in the Continental USA")
+```
+
+We can see from the above plot that, not surprisingly, the effects of tornadoes are generally greatest in the so called ["Tornado Ally"](https://en.wikipedia.org/wiki/Tornado_Alley).  Interestingly, the greatest crop damage due to tornadoes is in Mississippi. 
